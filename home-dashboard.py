@@ -608,11 +608,18 @@ class DashboardConfig:
         new_name = (new_name or "").strip()
         if not new_name:
             return
-        old_section.items = [i for i in old_section.items if i is not old_item]
+        try:
+            index = old_section.items.index(old_item)
+        except ValueError:
+            return
         target = self._ensure_section(new_section_title)
         old_item.name = new_name
-        target.items.append(old_item)
-        self._drop_empty_sections()
+        if target is old_section:
+            old_section.items[index] = old_item
+        else:
+            old_section.items.pop(index)
+            target.items.append(old_item)
+            self._drop_empty_sections()
 
     def remove_item(self, item):
         for section in self.sections:
@@ -1494,20 +1501,27 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
         attempts = [0]
 
         def try_inject():
-            if getattr(slot, "_hd_state", None) is not None:
-                return GLib.SOURCE_REMOVE
             try:
-                if slot.get_parent() is None:
+                if getattr(slot, "_hd_state", None) is not None:
+                    slot._hd_pending = False
                     return GLib.SOURCE_REMOVE
-            except Exception:
+                try:
+                    if slot.get_parent() is None:
+                        slot._hd_pending = False
+                        return GLib.SOURCE_REMOVE
+                except Exception:
+                    slot._hd_pending = False
+                    return GLib.SOURCE_REMOVE
+                attempts[0] += 1
+                if not _slot_ready(slot) and attempts[0] < 200:
+                    return GLib.SOURCE_CONTINUE
+                GLib.idle_add(
+                    self._inject_slot, window, slot, priority=GLib.PRIORITY_LOW
+                )
                 return GLib.SOURCE_REMOVE
-            attempts[0] += 1
-            if not _slot_ready(slot) and attempts[0] < 200:
-                return GLib.SOURCE_CONTINUE
-            GLib.idle_add(
-                self._inject_slot, window, slot, priority=GLib.PRIORITY_LOW
-            )
-            return GLib.SOURCE_REMOVE
+            except Exception:
+                slot._hd_pending = False
+                return GLib.SOURCE_REMOVE
 
         GLib.timeout_add(50, try_inject)
 
@@ -1808,7 +1822,10 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
                     continue
                 if not file_info.is_directory():
                     continue
-                path = file_info.get_location().get_path()
+                location = file_info.get_location()
+                if location is None:
+                    continue
+                path = location.get_path()
                 if path:
                     directories.append(path)
             except Exception:

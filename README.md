@@ -31,6 +31,7 @@ A clean, beginner-friendly **Home Dashboard** for GNOME Files (Nautilus). When y
 - ✅ Auto-show toggle (show dashboard every time you open Home)
 - ✅ Per-tab awareness (each Nautilus tab behaves independently)
 - ✅ English, French, and German UI strings
+- ✅ Works in Nautilus 51's FileChooser portal backend (apps' Open/Save dialogs) via the `home-dashboard portal backend.py` build
 - ✅ Tested on Nautilus 51.1 (Fedora 45) · also supports Nautilus 46 via the 4.0 import fallback
 
 ---
@@ -44,6 +45,20 @@ A clean, beginner-friendly **Home Dashboard** for GNOME Files (Nautilus). When y
 - No other dependencies
 
 ## Installation
+
+### Quick install
+
+```bash
+./install.sh              # choose a build interactively
+./install.sh --portal     # portal-backend build (recommended)
+./install.sh --standard   # classic build
+```
+
+The installer checks the runtime dependencies, installs for the current user, and restarts Nautilus. It also supports `--system` for a system-wide install, `--uninstall`, and `--uninstall --purge` (removes the JSON config too).
+
+> Only one build can be installed at a time — both register the same extension and would otherwise show two dashboards.
+
+The distro commands below are the manual equivalent.
 
 ### Fedora
 
@@ -66,6 +81,13 @@ nautilus -q
 ```
 
 > The `nautilus-python` package is essential — without it, Nautilus simply ignores the `.py` file and nothing changes.
+
+The repository also contains **`home-dashboard portal backend.py`**, which additionally injects the dashboard into Nautilus's `NautilusFileChooser` portal windows (the dialogs other apps use to open/save files). Install it under the usual name:
+
+```bash
+cp "home-dashboard portal backend.py" ~/.local/share/nautilus-python/extensions/home-dashboard.py
+nautilus -q
+```
 
 ### Verify
 
@@ -97,10 +119,12 @@ Reopen Files → **Home**. You should see the dashboard instead of the raw folde
 
 Nautilus 43+ removed `LocationWidgetProvider` and has no public "custom view" API. To still replace what Home shows, this extension:
 
-1. Finds every `NautilusWindowSlot`'s top-level `GtkStack` (via `Adw.TabView → page → slot`).
+1. Finds every `NautilusWindowSlot`'s top-level `GtkStack` (via `Adw.TabView → page → slot` in normal windows, or directly inside the non-tabbed `NautilusFileChooser` portal window).
 2. Adds the dashboard as a third child of that stack, alongside Nautilus's own views.
 3. Shows the dashboard child only when the slot's location equals `$HOME`, restoring the native child otherwise (handles tabs, back/forward, pathbar, location bar).
 4. Uses solid GTK 4 + libadwaita widgets (FlowBox cards, `Adw.Clamp`, `Adw.WindowTitle`), so it follows your light/dark theme and icon theme.
+
+The FileChooser portal backend is the `NautilusFileChooser` window that Nautilus 47+ provides for other apps' Open/Save dialogs. It has no `Adw.TabView`, so the extension detects it directly and injects into its single slot. The dashboard then follows the same **Show dashboard when Home is opened** setting: when a dialog starts in `$HOME`, you get the dashboard, and *Show all files* brings back the normal file list so a file can be selected.
 
 Because step 1 touches internals, it may need small tweaks when Nautilus changes its widget tree — but the context-menu items keep working even if injection ever fails.
 
@@ -117,6 +141,13 @@ Because step 1 touches internals, it may need small tweaks when Nautilus changes
 ---
 
 ## Uninstall
+
+```bash
+./install.sh --uninstall          # remove the extension, keep the config
+./install.sh --uninstall --purge  # also remove the config
+```
+
+Or manually:
 
 ```bash
 rm ~/.local/share/nautilus-python/extensions/home-dashboard.py
