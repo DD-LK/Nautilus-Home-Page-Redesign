@@ -48,6 +48,7 @@ import json
 import locale
 import os
 import tempfile
+import time
 import weakref
 from dataclasses import dataclass, field
 
@@ -75,6 +76,32 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
 HOME_DIR = os.path.realpath(GLib.get_home_dir())
 HOME_FILE = Gio.File.new_for_path(HOME_DIR)
+
+# $HOME can be exposed through a symlink on some systems.  Accept both the
+# resolved and the configured spelling when deciding whether a slot is Home.
+_HOME_PATHS = {HOME_DIR, os.path.normpath(GLib.get_home_dir())}
+HOME_FILES = tuple(Gio.File.new_for_path(path) for path in sorted(_HOME_PATHS))
+
+
+def _is_home_path(path):
+    if not path:
+        return False
+    try:
+        return (
+            os.path.realpath(path) in _HOME_PATHS
+            or os.path.normpath(path) in _HOME_PATHS
+        )
+    except OSError:
+        return False
+
+
+def _path_key(path):
+    """Canonical key used only for de-duplication; display paths are kept."""
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return os.path.normpath(path or "")
+
 
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "nautilus-home-dashboard")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -134,6 +161,7 @@ if _lang.startswith("fr"):
         "choose_folder": "Choisir un dossier à ajouter",
         "name_required": "Le nom affiché ne peut pas être vide.",
         "already_added": "Ce dossier figure déjà sur le tableau de bord.",
+        "home_not_allowed": "Votre dossier personnel est affiché automatiquement et ne peut pas être ajouté comme raccourci.",
         "cancel": "Annuler",
         "save": "Enregistrer",
         "reset": "Rétablir",
@@ -187,6 +215,7 @@ elif _lang.startswith("de"):
         "choose_folder": "Ordner zum Hinzufügen wählen",
         "name_required": "Der Anzeigename darf nicht leer sein.",
         "already_added": "Dieser Ordner ist bereits auf dem Dashboard.",
+        "home_not_allowed": "Dein Home-Ordner wird automatisch angezeigt und kann nicht als Verknüpfung hinzugefügt werden.",
         "cancel": "Abbrechen",
         "save": "Speichern",
         "reset": "Zurücksetzen",
@@ -240,6 +269,7 @@ else:
         "choose_folder": "Choose a folder to add",
         "name_required": "The display name cannot be empty.",
         "already_added": "This folder is already on the dashboard.",
+        "home_not_allowed": "Your home folder is shown automatically and cannot be added as a shortcut.",
         "cancel": "Cancel",
         "save": "Save",
         "reset": "Restore",
@@ -286,7 +316,7 @@ def _is_real_dir(path):
     try:
         if not os.path.isdir(path):
             return False
-        return os.path.realpath(path) != HOME_DIR
+        return not _is_home_path(path)
     except OSError:
         return False
 
@@ -370,8 +400,12 @@ class Section:
 
     @classmethod
     def from_dict(cls, data):
+        data = data if isinstance(data, dict) else {}
         section = cls(title=str(data.get("title") or "").strip())
-        for raw in data.get("items") or []:
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list):
+            raw_items = []
+        for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             item = Shortcut.from_dict(raw)
@@ -396,8 +430,17 @@ class DashboardConfig:
 
     @classmethod
     def from_dict(cls, data):
-        config = cls(auto_show=bool(data.get("auto_show", True)))
-        for raw in data.get("sections") or []:
+        data = data if isinstance(data, dict) else {}
+        raw_auto = data.get("auto_show", True)
+        if isinstance(raw_auto, str):
+            auto_show = raw_auto.strip().lower() not in ("false", "0", "no", "off")
+        else:
+            auto_show = bool(raw_auto)
+        config = cls(auto_show=auto_show)
+        raw_sections = data.get("sections")
+        if not isinstance(raw_sections, list):
+            raw_sections = []
+        for raw in raw_sections:
             if not isinstance(raw, dict):
                 continue
             section = Section.from_dict(raw)
@@ -416,11 +459,13 @@ class DashboardConfig:
             clean_items = []
             for item in section.items:
                 path = _normalise_path(item.path)
-                if not item.name or not path or path in seen:
+                key = _path_key(path)
+                name = (item.name or "").strip()
+                if not name or not path or key in seen or _is_home_path(path):
                     continue
-                seen.add(path)
-                icon = item.icon or _icon_for(item.name, path)
-                clean_items.append(Shortcut(item.name.strip(), path, icon))
+                seen.add(key)
+                icon = item.icon or _icon_for(name, path)
+                clean_items.append(Shortcut(name, path, icon))
             if clean_items:
                 clean_sections.append(Section(title, clean_items))
         self.sections = clean_sections
@@ -442,6 +487,15 @@ class DashboardConfig:
                 except OSError:
                     pass
                 os.replace(tmp_path, CONFIG_PATH)
+                # Make the rename durable, not just the file contents.
+                try:
+                    dir_fd = os.open(CONFIG_DIR, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
             except Exception:
                 try:
                     os.unlink(tmp_path)
@@ -450,12 +504,29 @@ class DashboardConfig:
                 raise
         except Exception as exc:
             _log(f"could not save config: {exc}")
+            return False
+        return True
+
+    @staticmethod
+    def _quarantine_corrupt_config():
+        """Keep an unreadable config so a later save cannot destroy it."""
+        try:
+            if not os.path.isfile(CONFIG_PATH):
+                return
+            backup = "{}.corrupt-{}".format(CONFIG_PATH, int(time.time()))
+            os.replace(CONFIG_PATH, backup)
+            _log(f"moved unreadable config to {backup}")
+        except Exception as exc:
+            _log(f"could not back up corrupt config: {exc}")
 
     @classmethod
     def load(cls):
         if not os.path.exists(CONFIG_PATH):
             config = cls.default(save=False)
-            config.save()
+            # Do not freeze an empty default on disk: on a fresh account the
+            # standard folders may not exist yet, so we want to retry later.
+            if config.sections:
+                config.save()
             return config
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
@@ -465,6 +536,7 @@ class DashboardConfig:
             return cls.from_dict(data)
         except Exception as exc:
             _log(f"could not read config ({exc}); using in-memory defaults")
+            cls._quarantine_corrupt_config()
             return cls.default(save=False)
 
     # -- default dashboard --------------------------------------------------
@@ -479,9 +551,10 @@ class DashboardConfig:
             for name, candidates, icon in entries:
                 for candidate in candidates:
                     path = _normalise_path(candidate)
-                    if path in seen or not _is_real_dir(path):
+                    key = _path_key(path)
+                    if key in seen or not _is_real_dir(path):
                         continue
-                    seen.add(path)
+                    seen.add(key)
                     items.append(Shortcut(name, path, icon))
                     break
             if items:
@@ -516,10 +589,11 @@ class DashboardConfig:
             if not path:
                 continue
             path = _normalise_path(path)
-            if path in seen or not _is_real_dir(path):
+            key = _path_key(path)
+            if key in seen or not _is_real_dir(path):
                 continue
             name = os.path.basename(path.rstrip(os.sep)) or "Folder"
-            seen.add(path)
+            seen.add(key)
             places.append(Shortcut(name, path, icon))
         if places:
             config.sections.append(Section(T["section_places"], places))
@@ -537,8 +611,9 @@ class DashboardConfig:
 
     def find_item(self, path):
         path = _normalise_path(path)
+        key = _path_key(path)
         for section, item in self.iter_items():
-            if item.path == path:
+            if item.path == path or _path_key(item.path) == key:
                 return section, item
         return None, None
 
@@ -568,13 +643,15 @@ class DashboardConfig:
         seen = set()
         for raw in paths:
             path = _normalise_path(raw)
+            key = _path_key(path)
             if (
                 not path
-                or path in seen
+                or _is_home_path(path)
+                or key in seen
                 or self.find_item(path)[1] is not None
             ):
                 continue
-            seen.add(path)
+            seen.add(key)
             new_paths.append(path)
         if not new_paths:
             return 0
@@ -597,6 +674,9 @@ class DashboardConfig:
         return len(new_paths)
 
     def add_item(self, section_title, item):
+        item.path = _normalise_path(item.path)
+        if not item.name or not item.path or _is_home_path(item.path):
+            return None, None
         existing_section, existing = self.find_item(item.path)
         if existing is not None:
             return existing_section, existing
@@ -608,18 +688,24 @@ class DashboardConfig:
         new_name = (new_name or "").strip()
         if not new_name:
             return
-        try:
-            index = old_section.items.index(old_item)
-        except ValueError:
+        # Identity, not dataclass equality: editing one of two look-alike
+        # shortcuts must never edit the other one.
+        index = next(
+            (i for i, candidate in enumerate(old_section.items)
+             if candidate is old_item),
+            -1,
+        )
+        if index < 0:
             return
         target = self._ensure_section(new_section_title)
         old_item.name = new_name
+        old_item.icon = _icon_for(new_name, old_item.path)
+        # Renaming inside the same section keeps the item's position.
         if target is old_section:
-            old_section.items[index] = old_item
-        else:
-            old_section.items.pop(index)
-            target.items.append(old_item)
-            self._drop_empty_sections()
+            return
+        old_section.items.pop(index)
+        target.items.append(old_item)
+        self._drop_empty_sections()
 
     def remove_item(self, item):
         for section in self.sections:
@@ -627,9 +713,11 @@ class DashboardConfig:
         self._drop_empty_sections()
 
     def move_item(self, section, item, delta):
-        try:
-            index = section.items.index(item)
-        except ValueError:
+        index = next(
+            (i for i, candidate in enumerate(section.items) if candidate is item),
+            -1,
+        )
+        if index < 0:
             return False
         new_index = index + delta
         if new_index < 0 or new_index >= len(section.items):
@@ -823,10 +911,13 @@ def _slot_location(slot):
 def _location_is_home(location):
     if location is None:
         return False
-    try:
-        return location.equal(HOME_FILE)
-    except Exception:
-        return False
+    for candidate in HOME_FILES:
+        try:
+            if location.equal(candidate):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _slot_ready(slot):
@@ -1045,8 +1136,9 @@ def build_dashboard_panel(config, callbacks):
 class ShortcutDialog(Adw.Window):
     __gtype_name__ = "HomeDashboardShortcutDialog"
 
-    def __init__(self, parent, path, name, section, on_save):
-        super().__init__(title=T["dialog_edit_title"])
+    def __init__(self, parent, path, name, section, on_save, title=None):
+        title = title or T["dialog_edit_title"]
+        super().__init__(title=title)
         self._on_save = on_save
         self._path = path
         self.set_modal(True)
@@ -1055,9 +1147,7 @@ class ShortcutDialog(Adw.Window):
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(
-            Adw.WindowTitle(title=T["dialog_edit_title"], subtitle="")
-        )
+        header.set_title_widget(Adw.WindowTitle(title=title, subtitle=""))
         cancel = Gtk.Button(label=T["cancel"])
         cancel.connect("clicked", lambda *_args: self.close())
         save = Gtk.Button(label=T["save"])
@@ -1096,6 +1186,8 @@ class ShortcutDialog(Adw.Window):
         GLib.idle_add(self._focus_name)
 
     def _focus_name(self):
+        if not self.get_visible():
+            return GLib.SOURCE_REMOVE
         self._name_row.grab_focus()
         return GLib.SOURCE_REMOVE
 
@@ -1140,6 +1232,7 @@ class DashboardEditor(Adw.Window):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
+        self._scrolled = scrolled
 
         self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         self._content.set_margin_top(18)
@@ -1168,6 +1261,10 @@ class DashboardEditor(Adw.Window):
             child = next_child
 
     def _build(self):
+        # Rebuilding the rows drops scroll/focus; keep the scroll offset so
+        # repeated move/edit actions in a long list stay usable.
+        adjustment = self._scrolled.get_vadjustment()
+        scroll_top = adjustment.get_value() if adjustment is not None else 0.0
         self._clear()
         config = self._ext.config
 
@@ -1256,6 +1353,12 @@ class DashboardEditor(Adw.Window):
             wrap=True,
         )
         self._content.append(hint)
+        if adjustment is not None:
+            def restore_scroll():
+                upper = max(0.0, adjustment.get_upper() - adjustment.get_page_size())
+                adjustment.set_value(min(scroll_top, upper))
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(restore_scroll)
 
     def refresh(self):
         if self.get_visible():
@@ -1269,15 +1372,13 @@ class DashboardEditor(Adw.Window):
     def _move(self, item, section, delta):
         if self._ext.config.move_item(section, item, delta):
             self._ext.save_and_refresh()
-            self._build()
 
     def _remove_item(self, section, item):
         self._ext.config.remove_item(item)
         self._ext.save_and_refresh()
-        self._build()
 
     def _edit_item(self, section, item):
-        ShortcutDialog(
+        dialog = ShortcutDialog(
             self,
             path=item.path,
             name=item.name,
@@ -1285,12 +1386,12 @@ class DashboardEditor(Adw.Window):
             on_save=lambda name, new_section: self._save_edited_item(
                 section, item, name, new_section
             ),
-        ).present()
+        )
+        GLib.idle_add(dialog.present)
 
     def _save_edited_item(self, section, item, name, new_section):
         self._ext.config.update_item(section, item, name, new_section)
         self._ext.save_and_refresh()
-        self._build()
 
     # -- add folder ---------------------------------------------------------
 
@@ -1314,25 +1415,30 @@ class DashboardEditor(Adw.Window):
         if not path:
             return
         path = _normalise_path(path)
+        if _is_home_path(path):
+            _alert(self, T["home_not_allowed"])
+            return
         if self._ext.config.find_item(path)[1] is not None:
             _alert(self, T["already_added"])
             return
         section_title = T["section_shortcuts"]
         if self._ext.config.sections:
             section_title = self._ext.config.sections[-1].title
-        ShortcutDialog(
+        dialog = ShortcutDialog(
             self,
             path=path,
             name=os.path.basename(path) or path,
             section=section_title,
             on_save=lambda name, section: self._save_new_item(path, name, section),
-        ).present()
+            title=T["dialog_add_title"],
+        )
+        # Let the folder chooser finish closing before showing the next dialog.
+        GLib.idle_add(dialog.present)
 
     def _save_new_item(self, path, name, section):
         item = Shortcut(name, path, _icon_for(name, path))
         self._ext.config.add_item(section, item)
         self._ext.save_and_refresh()
-        self._build()
 
     # -- reset --------------------------------------------------------------
 
@@ -1354,7 +1460,6 @@ class DashboardEditor(Adw.Window):
         if response != "reset":
             return
         self._ext.reset_config()
-        self._build()
 
 
 # ---------------------------------------------------------------------------
@@ -1384,15 +1489,21 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def set_auto_show(self, enabled):
         self._config.auto_show = bool(enabled)
-        self.save_and_refresh()
+        # Rebuilding the editor from its own switch handler would destroy the
+        # row that is currently emitting "notify::active".
+        self.save_and_refresh(refresh_editor=False)
 
     def reset_config(self):
         self._config = DashboardConfig.default(save=False)
         self.save_and_refresh()
 
-    def save_and_refresh(self):
+    def save_and_refresh(self, refresh_editor=True):
         self._config.save()
         self._refresh_all()
+        if refresh_editor and self._editor is not None:
+            # The editor is modeless, so config changes made elsewhere must
+            # be reflected there too.
+            self._editor.refresh()
 
     # -- window / slot discovery -------------------------------------------
 
@@ -1428,8 +1539,11 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
         try:
             widgets = list(_all_widgets(window))
             has_tab_view = any(isinstance(w, Adw.TabView) for w in widgets)
-            has_slot = any("Slot" in type(w).__name__ for w in widgets)
-            return has_tab_view and has_slot
+            has_nautilus_slot = any(
+                "Nautilus" in type(w).__name__ and "Slot" in type(w).__name__
+                for w in widgets
+            )
+            return has_tab_view and has_nautilus_slot
         except Exception:
             return False
 
@@ -1443,6 +1557,7 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
         try:
             window.connect("destroy", self._on_window_destroyed)
             tab_view.connect("page-attached", self._on_page_attached, window)
+            tab_view.connect("page-detached", self._on_page_detached, window)
         except Exception as exc:
             _log(f"could not watch window: {exc}")
         self._install_shortcut(window)
@@ -1454,7 +1569,54 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def _on_page_attached(self, _tab_view, page, _position, window):
         slot = page.get_child() if page is not None else None
+        if slot is None:
+            return
+        state = getattr(slot, "_hd_state", None)
+        if state is not None and (
+            state.get("window") is not window
+            or state["panel"].get_parent() is not state["stack"]
+        ):
+            # The tab moved to another window/tab view.  Its state still
+            # points at the old stack, so drop it and inject a fresh panel.
+            self._teardown_slot(slot, state)
+            state = None
         self._watch_slot(window, slot)
+
+    def _on_page_detached(self, _tab_view, page, _position, _window):
+        slot = page.get_child() if page is not None else None
+        if slot is None:
+            return
+        state = getattr(slot, "_hd_state", None)
+        if state is not None:
+            self._teardown_slot(slot, state)
+
+    def _teardown_slot(self, slot, state, remove_panel=True):
+        """Disconnect handlers and forget a slot's dashboard state."""
+        try:
+            for key in ("stack_notify_id", "location_notify_id", "destroy_id"):
+                handler_id = state.get(key)
+                if handler_id is None:
+                    continue
+                target = slot if key != "stack_notify_id" else state["stack"]
+                target.disconnect(handler_id)
+            if remove_panel:
+                panel = state["panel"]
+                stack = state["stack"]
+                if panel.get_parent() is stack:
+                    stack.remove(panel)
+        except Exception as exc:
+            _log(f"could not tear down slot state: {exc}")
+        try:
+            if getattr(slot, "_hd_state", None) is state:
+                del slot._hd_state
+        except AttributeError:
+            pass
+        self._slots.discard(slot)
+
+    def _on_slot_destroyed(self, slot):
+        state = getattr(slot, "_hd_state", None)
+        if state is not None:
+            self._teardown_slot(slot, state, remove_panel=False)
 
     def _install_shortcut(self, window):
         if window in self._shortcut_windows:
@@ -1565,11 +1727,25 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
 
         try:
             stack.add_named(panel, child_name)
-            stack.connect("notify::visible-child", self._on_stack_visible_child, slot)
-            slot.connect("notify::location", self._on_slot_location)
+            state["stack_notify_id"] = stack.connect(
+                "notify::visible-child", self._on_stack_visible_child, slot
+            )
+            state["location_notify_id"] = slot.connect(
+                "notify::location", self._on_slot_location
+            )
+            state["destroy_id"] = slot.connect("destroy", self._on_slot_destroyed)
         except Exception as exc:
             _log(f"could not inject dashboard: {exc}")
-            slot._hd_state = None
+            # Roll back fully so a later retry cannot add a second panel.
+            try:
+                if panel.get_parent() is stack:
+                    stack.remove(panel)
+            except Exception:
+                pass
+            try:
+                del slot._hd_state
+            except AttributeError:
+                pass
             self._slots.discard(slot)
             return GLib.SOURCE_REMOVE
 
@@ -1680,18 +1856,21 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
         state = getattr(slot, "_hd_state", None)
         if state is None:
             slot._hd_manual_show = True
+        else:
+            # Set this BEFORE navigating: notify::location fires synchronously
+            # inside activate_action and decides whether to show the panel.
+            state["manual_show"] = True
+            state["force_native"] = False
         if not _location_is_home(_slot_location(slot)):
             if not self._navigate(slot, HOME_DIR):
                 return
-            # _on_slot_location() will enter because manual_show is set below
-            if state is not None:
-                state["manual_show"] = True
-                state["force_native"] = False
+            # Some navigation fallbacks move a different slot; only enter if
+            # this one actually ended up at Home.
+            if state is not None and _location_is_home(_slot_location(slot)):
+                self._enter(state)
             return
         if state is None:
             return
-        state["manual_show"] = True
-        state["force_native"] = False
         self._enter(state)
 
     def _refresh_all(self):
@@ -1699,9 +1878,18 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
             state = getattr(slot, "_hd_state", None)
             if state is None or state["panel"].get_parent() is None:
                 continue
+            panel = state["panel"]
+            adjustment = panel.get_vadjustment()
+            scroll_top = adjustment.get_value() if adjustment is not None else 0.0
             body, refs = build_dashboard_body(self._config, state["callbacks"])
-            state["panel"].set_child(body)
+            panel.set_child(body)
             state["refs"] = refs
+            if adjustment is not None:
+                def restore_scroll(adj=adjustment, top=scroll_top):
+                    upper = max(0.0, adj.get_upper() - adj.get_page_size())
+                    adj.set_value(min(top, upper))
+                    return GLib.SOURCE_REMOVE
+                GLib.idle_add(restore_scroll)
             is_home = _location_is_home(_slot_location(slot))
             if (
                 is_home
@@ -1795,18 +1983,21 @@ class HomeDashboardExtension(GObject.GObject, Nautilus.MenuProvider):
     def _open_editor(self, slot=None, start_add=False):
         window = _window_for_slot(slot) if slot is not None else _nautilus_window()
         if self._editor is not None:
-            self._editor.present()
+            editor = self._editor
+            editor.present()
         else:
             editor = DashboardEditor(self, window, slot)
             editor.connect("destroy", self._on_editor_destroyed)
             self._editor = editor
             editor.present()
         if start_add:
-            GLib.idle_add(self._editor_add_folder)
+            # Add to the editor we actually opened, not to whatever editor
+            # happens to be current when the idle callback runs.
+            GLib.idle_add(self._editor_add_folder, editor)
 
-    def _editor_add_folder(self):
-        if self._editor is not None:
-            self._editor.add_folder()
+    def _editor_add_folder(self, editor):
+        if self._editor is editor:
+            editor.add_folder()
         return GLib.SOURCE_REMOVE
 
     def _on_editor_destroyed(self, _editor):
